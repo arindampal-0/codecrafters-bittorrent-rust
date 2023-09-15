@@ -1,9 +1,25 @@
-use core::panic;
+use serde::{Serialize, Deserialize};
+use serde_bytes::ByteBuf;
 use serde_json;
 use std::env;
 
 // Available if you need it!
 use serde_bencode;
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Info {
+    name: String,
+    pieces: ByteBuf,
+    #[serde(rename = "piece length")]
+    piece_length: i64,
+    length: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct TorrentMetadata {
+    announce: String,
+    info: Info,
+}
 
 /// Returns the `end_index` of the next datatype
 ///
@@ -22,8 +38,12 @@ fn get_end_index_for_next_datatype(
 
     // Next String data
     if encoded_value_range.chars().next().unwrap().is_digit(10) {
-        let colon_index = encoded_value_range.find(':').expect(": is missing, string should be <size>:<string>");
-        let size = encoded_value_range[..colon_index].parse::<i64>().expect("size is not a number in <size>:<string>") as usize;
+        let colon_index = encoded_value_range
+            .find(':')
+            .expect(": is missing, string should be <size>:<string>");
+        let size = encoded_value_range[..colon_index]
+            .parse::<i64>()
+            .expect("size is not a number in <size>:<string>") as usize;
         end_index = colon_index + size;
     }
     // Next Int data
@@ -62,7 +82,10 @@ fn get_end_index_for_next_datatype(
                 break;
             }
 
-            next_index = get_end_index_for_next_datatype(encoded_value, start_index + next_index, end_index) + 1 - start_index;
+            next_index =
+                get_end_index_for_next_datatype(encoded_value, start_index + next_index, end_index)
+                    + 1
+                    - start_index;
         }
 
         end_index = next_index;
@@ -76,7 +99,9 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
     // If encoded_value starts with a digit, it's a string
     if encoded_value.chars().next().unwrap().is_digit(10) {
         // Example: "5:hello" -> "hello"
-        let colon_index = encoded_value.find(':').expect(": is missing, string should be <size>:<string>");
+        let colon_index = encoded_value
+            .find(':')
+            .expect(": is missing, string should be <size>:<string>");
         // let number_string = &encoded_value[..colon_index];
         // let string_length = number_string.parse::<i64>().unwrap();
         // let string = &encoded_value[colon_index + 1..colon_index + 1 + string_length as usize];
@@ -180,30 +205,51 @@ fn transform_bencode_to_json(value: &serde_bencode::value::Value) -> serde_json:
 }
 
 #[allow(dead_code)]
-fn decode_bencoded_value_serde_bencode(encoded_value: &str) -> serde_json::Value {
-    let value: serde_bencode::value::Value = serde_bencode::from_str(encoded_value).unwrap();
+fn decode_bencoded_value_serde_bencode(encoded_value: &[u8]) -> serde_json::Value {
+    let value: serde_bencode::value::Value = serde_bencode::from_bytes(encoded_value).unwrap();
     return transform_bencode_to_json(&value);
 }
+
+
+
+// #[allow(dead_code)]
+// fn get_torrent_info(torrent_file_contents: &[u8]) {
+//     let dictionary = decode_bencoded_value_serde_bencode(torrent_file_contents);
+//     println!("torrent_metadata: {:?}", dictionary);
+// }
 
 // Usage: your_bittorrent.sh decode "<encoded_value>"
 fn main() {
     let args: Vec<String> = env::args().collect();
+    // let command = args.get(1).expect("No command specified");
     let command = &args[1];
 
     if command == "decode" {
-        // You can use print statements as follows for debugging, they'll be visible when running tests.
-        // println!("Logs from your program will appear here!");
-
-        // Uncomment this block to pass the first stage
         let encoded_value = &args[2];
 
         // uses self-made bencode parser
         // let decoded_value = decode_bencoded_value(encoded_value);
 
         // uses serde_bencode for parsing
-        let decoded_value = decode_bencoded_value_serde_bencode(encoded_value);
+        let decoded_value = decode_bencoded_value_serde_bencode(encoded_value.as_bytes());
 
         println!("{}", decoded_value.to_string());
+    } else if command == "info" {
+        let torrent_file_path = &args[2];
+
+        let file_contents =
+            std::fs::read(torrent_file_path).expect("Not able to read torrent file.");
+
+        // let decoded_value = decode_bencoded_value_serde_bencode(&file_contents);
+
+        // println!("{}", decoded_value.to_string());
+
+        let torrent_metadata = serde_bencode::from_bytes::<TorrentMetadata>(&file_contents).unwrap();
+        println!("Tracker URL: {}", torrent_metadata.announce);
+        // println!("Info: {:?}", torrent_metadata.info);
+        println!("Length: {}", torrent_metadata.info.length.unwrap())
+
+        // get_torrent_info(&file_contents);
     } else {
         println!("unknown command: {}", args[1])
     }
