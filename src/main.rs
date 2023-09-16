@@ -5,6 +5,8 @@ use serde_bytes::ByteBuf;
 use serde_json;
 use sha1::{Digest, Sha1};
 use std::env;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Info {
@@ -23,8 +25,7 @@ struct TorrentMetadata {
 
 impl TorrentMetadata {
     pub fn from_file(file_path: String) -> Self {
-        let file_contents =
-            std::fs::read(file_path).expect("Not able to read torrent file.");
+        let file_contents = std::fs::read(file_path).expect("Not able to read torrent file.");
 
         // let decoded_value = decode_bencoded_value_serde_bencode(&file_contents);
 
@@ -35,11 +36,7 @@ impl TorrentMetadata {
 
     pub fn hash_str(&self) -> String {
         let hash = self.hash_bytes();
-        let mut s = String::new();
-        for byte in hash {
-            s.push_str(&format!("{:02x}", byte))
-        }
-        s
+        to_hex_string(&hash)
     }
 
     pub fn hash_bytes(&self) -> [u8; 20] {
@@ -87,6 +84,14 @@ impl TrackerResponse {
             })
             .collect()
     }
+}
+
+fn to_hex_string(bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for byte in bytes {
+        s += format!("{:02x}", byte).as_str();
+    }
+    s
 }
 
 fn transform_bencode_to_json(value: &serde_bencode::value::Value) -> serde_json::Value {
@@ -203,6 +208,32 @@ async fn get_torrent_peers(torrent_file_path: &String) -> Result<()> {
     Ok(())
 }
 
+// For command: "handshake"
+fn peer_handshake(torrent_file_path: &String, peer_address: &String) {
+    let torrent_metadata = TorrentMetadata::from_file(torrent_file_path.clone());
+    let mut stream = TcpStream::connect(peer_address).expect("tcp connection failed!");
+
+    // Length of the protocol string (1 Byte)
+    let mut message: Vec<u8> = vec![19];
+    // protocol string (19 Bytes)
+    message.extend(b"BitTorrent protocol");
+    // eight reserved bytes, all zeros (8 Bytes)
+    message.extend(&[0; 8]);
+    // sha1 info_hash (20 Bytes)
+    message.extend(torrent_metadata.hash_bytes());
+    // peer id (20 Bytes)
+    message.extend(b"00112233445566778899");
+
+    let message_length = stream.write(&message).unwrap();
+
+    let mut res_message: Vec<u8> = vec![0; message_length];
+    let res_message_length = stream.read(&mut res_message).unwrap();
+
+    let res_peer_id = &res_message[res_message_length - 20..];
+
+    println!("Peer ID: {}", to_hex_string(res_peer_id));
+}
+
 // Usage: your_bittorrent.sh decode "<encoded_value>"
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -219,6 +250,10 @@ async fn main() -> Result<()> {
     } else if command == "peers" {
         let torrent_file_path = &args[2];
         get_torrent_peers(torrent_file_path).await?;
+    } else if command == "handshake" {
+        let torrent_file_path = &args[2];
+        let peer_address = &args[3];
+        peer_handshake(torrent_file_path, peer_address);
     } else {
         println!("unknown command: {}", args[1]);
     }
