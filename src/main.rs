@@ -1,3 +1,4 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_bencode;
 use serde_bytes::ByteBuf;
@@ -20,162 +21,71 @@ struct TorrentMetadata {
     info: Info,
 }
 
-/// Returns the `end_index` of the next datatype
-///
-/// # Arguments
-/// * `encoded_value` - string slice for parsing the next datatype
-/// * `start_index` - `usize` for inclusive start index
-/// * `end_index` - `usize` for inclusive end index
-fn get_end_index_for_next_datatype(
-    encoded_value: &str,
-    start_index: usize,
-    end_index: usize,
-) -> usize {
-    let mut end_index = end_index;
+impl TorrentMetadata {
+    pub fn from_file(file_path: String) -> Self {
+        let file_contents =
+            std::fs::read(file_path).expect("Not able to read torrent file.");
 
-    let encoded_value_range = &encoded_value[start_index..=end_index];
+        // let decoded_value = decode_bencoded_value_serde_bencode(&file_contents);
 
-    // Next String data
-    if encoded_value_range.chars().next().unwrap().is_digit(10) {
-        let colon_index = encoded_value_range
-            .find(':')
-            .expect(": is missing, string should be <size>:<string>");
-        let size = encoded_value_range[..colon_index]
-            .parse::<i64>()
-            .expect("size is not a number in <size>:<string>") as usize;
-        end_index = colon_index + size;
+        // println!("{}", decoded_value.to_string());
+
+        serde_bencode::from_bytes(&file_contents).unwrap()
     }
-    // Next Int data
-    else if encoded_value_range.starts_with("i") {
-        end_index = encoded_value_range.find('e').unwrap();
-    }
-    // Next List data
-    else if encoded_value_range.starts_with("l") {
-        let mut next_index = 1 as usize;
-        loop {
-            if encoded_value_range
-                .get(next_index..)
-                .unwrap()
-                .starts_with("e")
-            {
-                break;
-            }
 
-            next_index =
-                get_end_index_for_next_datatype(encoded_value, start_index + next_index, end_index)
-                    + 1
-                    - start_index;
+    pub fn hash_str(&self) -> String {
+        let hash = self.hash_bytes();
+        let mut s = String::new();
+        for byte in hash {
+            s.push_str(&format!("{:02x}", byte))
         }
-
-        end_index = next_index;
-    }
-    // Next Dict data
-    else if encoded_value_range.starts_with("d") {
-        let mut next_index = 1 as usize;
-        loop {
-            if encoded_value_range
-                .get(next_index..)
-                .unwrap()
-                .starts_with("e")
-            {
-                break;
-            }
-
-            next_index =
-                get_end_index_for_next_datatype(encoded_value, start_index + next_index, end_index)
-                    + 1
-                    - start_index;
-        }
-
-        end_index = next_index;
+        s
     }
 
-    return start_index + end_index;
+    pub fn hash_bytes(&self) -> [u8; 20] {
+        let info_encoded_value = serde_bencode::to_bytes(&self.info).unwrap();
+        let mut hasher = Sha1::new();
+        hasher.update(info_encoded_value);
+        let hash = hasher.finalize();
+
+        hash.into()
+    }
+
+    pub fn print_peice_hashes(&self) {
+        self.info.pieces.chunks(20).for_each(|piece_hash| {
+            let hash: Vec<_> = piece_hash
+                .iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect();
+            println!("{}", hash.join(""));
+        });
+    }
 }
 
-#[allow(dead_code)]
-fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
-    // If encoded_value starts with a digit, it's a string
-    if encoded_value.chars().next().unwrap().is_digit(10) {
-        // Example: "5:hello" -> "hello"
-        let colon_index = encoded_value
-            .find(':')
-            .expect(": is missing, string should be <size>:<string>");
-        // let number_string = &encoded_value[..colon_index];
-        // let string_length = number_string.parse::<i64>().unwrap();
-        // let string = &encoded_value[colon_index + 1..colon_index + 1 + string_length as usize];
-        let num_string = &encoded_value[colon_index + 1..];
-        return serde_json::Value::String(num_string.to_string());
-    // If encoded_value starts with 'i' and ends with 'e', it's a number
-    } else if encoded_value.starts_with("i") && encoded_value.ends_with("e") {
-        // Example: "i52e" -> 52
-        // let e_index = encoded_value.find('e').unwrap();
-        // let number_string = &encoded_value[1..e_index];
-        // let number = number_string.parse::<i64>().unwrap();
-        let number = encoded_value
-            .strip_prefix("i")
-            .unwrap()
-            .strip_suffix("e")
-            .unwrap()
-            .parse::<i64>()
-            .unwrap();
-        return serde_json::Value::Number(number.into());
-    // If encoded_value starts with 'l' and ends with 'e', it's a list
-    } else if encoded_value.starts_with("l") && encoded_value.ends_with("e") {
-        // Example "l5:helloei2ee" -> ["hello", 2]
-        let mut values = Vec::new();
+#[derive(Serialize, Deserialize, Debug)]
+struct TrackerResponse {
+    interval: u64,
+    #[serde(with = "serde_bytes")]
+    peers: ByteBuf,
+}
 
-        let mut next_first_index = 1 as usize;
-        let end_index = encoded_value.len() - 1;
-        while next_first_index < end_index {
-            let next_end_index =
-                get_end_index_for_next_datatype(encoded_value, next_first_index, end_index);
+impl TrackerResponse {
+    #[allow(dead_code)]
+    fn print_peers(&self) -> Vec<String> {
+        self.peers
+            .chunks(6)
+            .map(|chunk| {
+                let ip = chunk[0..4]
+                    .iter()
+                    .map(|b| format!("{}", b))
+                    .collect::<Vec<String>>()
+                    .join(".");
 
-            let value = decode_bencoded_value(&encoded_value[next_first_index..=next_end_index]);
+                let port = u16::from_be_bytes([chunk[4], chunk[5]]);
 
-            values.push(value);
-
-            next_first_index = next_end_index + 1;
-        }
-
-        return serde_json::Value::Array(values);
-    // If encoded_value starts with 'd' and ends with 'e', it's a dictionary
-    } else if encoded_value.starts_with("d") && encoded_value.ends_with("e") {
-        // Example "d5:hello5:world3:fooi32ee" -> {"hello":"world","foo":3}
-        let mut map = serde_json::Map::new();
-
-        let mut next_first_index = 1 as usize;
-        let end_index = encoded_value.len() - 1;
-        while next_first_index < end_index {
-            let next_end_index =
-                get_end_index_for_next_datatype(encoded_value, next_first_index, end_index);
-
-            let key = decode_bencoded_value(&encoded_value[next_first_index..=next_end_index]);
-            if !key.is_string() {
-                panic!("key should be a string not a {:?}", key);
-            }
-
-            // let key = key.to_string().trim_matches('\"').to_string();
-            let key = key.as_str().unwrap().to_string();
-
-            next_first_index = next_end_index + 1;
-            if next_first_index >= end_index {
-                panic!("only key but no value is present, key-value pair should be present");
-            }
-
-            let next_end_index =
-                get_end_index_for_next_datatype(encoded_value, next_first_index, end_index);
-
-            let value = decode_bencoded_value(&encoded_value[next_first_index..=next_end_index]);
-
-            map.insert(key, value);
-
-            next_first_index = next_end_index + 1;
-        }
-
-        return serde_json::Value::Object(map);
-    } else {
-        panic!("Unhandled encoded value: {}", encoded_value)
+                format!("{}:{}", ip, port)
+            })
+            .collect()
     }
 }
 
@@ -215,66 +125,103 @@ fn decode_bencoded_value_serde_bencode(encoded_value: &[u8]) -> serde_json::Valu
     return transform_bencode_to_json(&value);
 }
 
-// #[allow(dead_code)]
-// fn get_torrent_info(torrent_file_contents: &[u8]) {
-//     let dictionary = decode_bencoded_value_serde_bencode(torrent_file_contents);
-//     println!("torrent_metadata: {:?}", dictionary);
-// }
+pub fn urlencode_hash(i: &[u8; 20]) -> String {
+    i.into_iter()
+        .map(|&b| match b {
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'-' | b'.' | b'_' | b'~' => {
+                format!("{}", b as char)
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect::<String>()
+}
+
+/// For command: "decode"
+fn decode(encoded_value: &String) {
+    // uses self-made bencode parser
+    // let decoded_value = decode_bencoded_value(encoded_value);
+
+    // uses serde_bencode for parsing
+    let decoded_value = decode_bencoded_value_serde_bencode(encoded_value.as_bytes());
+
+    println!("{}", decoded_value.to_string());
+}
+
+/// For command: "info"
+fn read_torrent_metadata(torrent_file_path: &String) {
+    let torrent_metadata = TorrentMetadata::from_file(torrent_file_path.clone());
+
+    println!("Tracker URL: {}", torrent_metadata.announce);
+    // println!("Info: {:?}", torrent_metadata.info);
+    println!("Length: {}", torrent_metadata.info.length.unwrap());
+
+    println!("Info Hash: {}", torrent_metadata.hash_str());
+
+    println!("Piece Length: {}", torrent_metadata.info.piece_length);
+
+    println!("Piece Hashes:");
+    torrent_metadata.print_peice_hashes();
+}
+
+// For command: "peers"
+async fn get_torrent_peers(torrent_file_path: &String) -> Result<()> {
+    let torrent_metadata = TorrentMetadata::from_file(torrent_file_path.clone());
+
+    let info_hash = torrent_metadata.hash_bytes();
+
+    let url = format!(
+        "{}?info_hash={}",
+        torrent_metadata.announce,
+        urlencode_hash(&info_hash)
+    );
+
+    let query = &[
+        ("peer_id", "00112233445566778899".to_string()),
+        ("port", "6881".to_string()),
+        ("uploaded", "0".to_string()),
+        ("downloaded", "0".to_string()),
+        ("left", torrent_metadata.info.length.unwrap().to_string()),
+        ("compact", "1".to_string()),
+    ];
+
+    let client = reqwest::Client::new();
+    let res = client.get(url).query(query).send().await?;
+
+    // println!("status_code: {}", res.status());
+
+    let res_bytes = res.bytes().await?;
+    // println!("res_bytes: {:?}", res_bytes);
+    let tracker_response: TrackerResponse =
+        serde_bencode::from_bytes(&res_bytes).expect("TranckerResponse could not be decoded.");
+    // println!("tracker_response: {:?}", tracker_response);
+
+    tracker_response
+        .print_peers()
+        .iter()
+        .for_each(|peer_str| println!("{}", peer_str));
+
+    Ok(())
+}
 
 // Usage: your_bittorrent.sh decode "<encoded_value>"
-fn main() {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     // let command = args.get(1).expect("No command specified");
     let command = &args[1];
 
     if command == "decode" {
         let encoded_value = &args[2];
-
-        // uses self-made bencode parser
-        // let decoded_value = decode_bencoded_value(encoded_value);
-
-        // uses serde_bencode for parsing
-        let decoded_value = decode_bencoded_value_serde_bencode(encoded_value.as_bytes());
-
-        println!("{}", decoded_value.to_string());
+        decode(encoded_value);
     } else if command == "info" {
         let torrent_file_path = &args[2];
-
-        let file_contents =
-            std::fs::read(torrent_file_path).expect("Not able to read torrent file.");
-
-        // let decoded_value = decode_bencoded_value_serde_bencode(&file_contents);
-
-        // println!("{}", decoded_value.to_string());
-
-        let torrent_metadata =
-            serde_bencode::from_bytes::<TorrentMetadata>(&file_contents).unwrap();
-        println!("Tracker URL: {}", torrent_metadata.announce);
-        // println!("Info: {:?}", torrent_metadata.info);
-        println!("Length: {}", torrent_metadata.info.length.unwrap());
-
-        // let decoded_value = decode_bencoded_value_serde_bencode(&file_contents);
-        // println!("decoded_value: {}", decoded_value);
-
-        let info_encoded_value = serde_bencode::to_bytes(&torrent_metadata.info).unwrap();
-
-        let mut hasher = Sha1::new();
-        hasher.update(info_encoded_value);
-        let info_hash = hasher.finalize();
-
-        println!("Info Hash: {:x}", info_hash);
-
-        println!("Piece Length: {}", torrent_metadata.info.piece_length);
-
-        println!("Piece Hashes:");
-        for piece_hash in torrent_metadata.info.pieces.chunks(20) {
-            let hash: Vec<_> = piece_hash
-                .iter()
-                .map(|byte| format!("{:02x}", byte))
-                .collect();
-            println!("{}", hash.join(""));
-        }
+        read_torrent_metadata(torrent_file_path);
+    } else if command == "peers" {
+        let torrent_file_path = &args[2];
+        get_torrent_peers(torrent_file_path).await?;
     } else {
         println!("unknown command: {}", args[1]);
     }
+
+    Ok(())
 }
