@@ -34,6 +34,6 @@ pub async fn parse_and_execute() {
         Command::Info(args) => info::execute(args),
         Command::Peers(args) => peers::execute(args).await,
         Command::Handshake(args) => handshake::execute(args),
-        Command::DownloadPiece(args) => download_piece::execute(args),
+        Command::DownloadPiece(args) => download_piece::execute(args).await,
     };
 }
