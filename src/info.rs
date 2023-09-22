@@ -23,5 +23,11 @@ pub fn execute(args: &InfoArgs) {
     println!("Piece Length: {}", torrent_metadata.info.piece_length);
 
     println!("Piece Hashes:");
-    torrent_metadata.info.print_peice_hashes();
+    torrent_metadata
+        .info
+        .get_piece_hashes_str()
+        .iter()
+        .for_each(|piece_hash_str| {
+            println!("{}", piece_hash_str);
+        });
 }

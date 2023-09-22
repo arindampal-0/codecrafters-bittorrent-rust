@@ -18,7 +18,7 @@ pub fn execute(args: &HandshakeArgs) {
     let mut connection = Connection::new(args.peer_address.clone());
     let res_peer_id = connection.handshake(
         torrent_metadata.info.hash_bytes().to_vec(),
-        "00112233445566778899",
+        "00112233445566778899".to_string(),
     );
 
     println!("Peer ID: {}", to_hex_string(&res_peer_id));

@@ -1,207 +1,492 @@
-use bittorrent_starter_rust::cli;
+use core::panic;
+use std::cmp::Ordering;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
+use sha1::{Digest, Sha1};
+
+mod cli;
+mod decode;
+mod download_piece;
+mod handshake;
+mod info;
+mod peers;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Info {
+    name: String,
+    pieces: ByteBuf,
+    #[serde(rename = "piece length")]
+    piece_length: u32,
+    length: Option<u32>,
+}
+
+impl Info {
+    pub fn hash_str(&self) -> String {
+        let hash = self.hash_bytes();
+        to_hex_string(&hash.to_vec())
+    }
+
+    pub fn hash_bytes(&self) -> [u8; 20] {
+        let info_encoded_value = serde_bencode::to_bytes(&self).unwrap();
+        calculate_hash(&info_encoded_value)
+            .try_into()
+            .expect("Could not convert Vec<u8> to [u8; 20]")
+    }
+
+    fn get_pieces_count(&self) -> usize {
+        self.pieces.chunks(20).count()
+    }
+
+    fn get_piece_hashes(&self) -> Vec<Vec<u8>> {
+        self.pieces.chunks(20).map(|chunk| chunk.to_vec()).collect()
+    }
+
+    pub fn get_piece_hashes_str(&self) -> Vec<String> {
+        self.get_piece_hashes()
+            .iter()
+            .map(|piece_hash| to_hex_string(&piece_hash))
+            .collect()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TorrentMetadata {
+    announce: String,
+    info: Info,
+}
+
+impl TorrentMetadata {
+    /// Read torrent file from given path and generates TorrentMetadata
+    pub fn from_file(file_path: PathBuf) -> Self {
+        let file_contents = std::fs::read(file_path).expect("Not able to read torrent file.");
+
+        // let decoded_value = decode_bencoded_value_serde_bencode(&file_contents);
+
+        // println!("{}", decoded_value.to_string());
+
+        serde_bencode::from_bytes(&file_contents).unwrap()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct TrackerResponse {
+    interval: u64,
+    #[serde(with = "serde_bytes")]
+    peers: ByteBuf,
+}
+
+impl TrackerResponse {
+    async fn from(torrent_metadata: &TorrentMetadata) -> Self {
+        let info_hash = torrent_metadata.info.hash_bytes();
+
+        let url = format!(
+            "{}?info_hash={}",
+            torrent_metadata.announce,
+            urlencode_hash(&info_hash)
+        );
+
+        let query = &[
+            ("peer_id", "00112233445566778899".to_string()),
+            ("port", "6881".to_string()),
+            ("uploaded", "0".to_string()),
+            ("downloaded", "0".to_string()),
+            ("left", torrent_metadata.info.length.unwrap().to_string()),
+            ("compact", "1".to_string()),
+        ];
+
+        let client = reqwest::Client::new();
+        let res = client.get(url).query(query).send().await.unwrap();
+
+        // println!("status_code: {}", res.status());
+
+        let res_bytes = res.bytes().await.unwrap();
+        // println!("res_bytes: {:?}", res_bytes);
+
+        serde_bencode::from_bytes(&res_bytes).expect("TranckerResponse could not be decoded.")
+    }
+}
+
+impl TrackerResponse {
+    #[allow(dead_code)]
+    fn get_peers(&self) -> Vec<String> {
+        self.peers
+            .chunks(6)
+            .map(|chunk| {
+                let ip = chunk[0..4]
+                    .iter()
+                    .map(|b| format!("{}", b))
+                    .collect::<Vec<String>>()
+                    .join(".");
+
+                let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+
+                format!("{}:{}", ip, port)
+            })
+            .collect()
+    }
+}
+
+struct Connection {
+    stream: TcpStream,
+}
+
+impl Connection {
+    fn new(peer: String) -> Self {
+        let stream = TcpStream::connect(peer).expect("tcp connection failed!");
+
+        Self { stream }
+    }
+
+    fn handshake(&mut self, info_hash: Vec<u8>, peer_id: String) -> Vec<u8> {
+        assert_eq!(peer_id.len(), 20, "peer_id should be 20 characters long");
+
+        // Length of the protocol string (1 Byte)
+        let mut message: Vec<u8> = vec![19];
+        // protocol string (19 Bytes)
+        message.extend(b"BitTorrent protocol");
+        // eight reserved bytes, all zeros (8 Bytes)
+        message.extend(&[0; 8]);
+        // sha1 info_hash (20 Bytes)
+        message.extend(info_hash);
+        // peer id (20 Bytes)
+        message.extend(b"00112233445566778899");
+
+        let message_length = self.stream.write(&message).unwrap();
+
+        let mut res_message: Vec<u8> = vec![0; message_length];
+        let res_message_length = self.stream.read(&mut res_message).unwrap();
+
+        let res_peer_id = &res_message[res_message_length - 20..];
+
+        res_peer_id.to_vec()
+    }
+
+    fn wait(&mut self, message_type: PeerMessageType) -> Vec<u8> {
+        let wait_messages_type = vec![
+            PeerMessageType::BitField,
+            PeerMessageType::Unchoke,
+            PeerMessageType::Piece,
+        ];
+
+        if wait_messages_type.contains(&message_type) {
+            let mut recv_message_length_buf: [u8; 4] = [0; 4];
+            self.stream
+                .read_exact(&mut recv_message_length_buf)
+                .expect("Could not read length buffer");
+
+            let recv_message_length = u32::from_be_bytes(recv_message_length_buf);
+            println!("recv_message_length: {}", recv_message_length);
+
+            let mut recv_message_id_buf: [u8; 1] = [0; 1];
+            self.stream
+                .read_exact(&mut recv_message_id_buf)
+                .expect("Could not read message id");
+
+            let recv_message_id = u8::from_be_bytes(recv_message_id_buf);
+            let recv_message_type = PeerMessageType::from(recv_message_id);
+            println!("recv_message_type: {:?}", recv_message_type);
+
+            assert_eq!(
+                message_type, recv_message_type,
+                "Message type expected {:?} but received {:?}",
+                message_type, recv_message_type
+            );
+
+            let payload_length = recv_message_length as usize - 1;
+            let mut payload_buf: Vec<u8> = vec![0; payload_length];
+            self.stream
+                .read_exact(&mut payload_buf)
+                .expect("Could not read payload");
+
+            println!("received payload length: {}", payload_buf.len());
+
+            return payload_buf;
+        } else {
+            panic!("Can not wait for this message type: {:?}", message_type);
+        }
+    }
+
+    fn send(&mut self, message_type: PeerMessageType, payload: Vec<u8>) {
+        let send_messages_type = vec![PeerMessageType::Interested, PeerMessageType::Request];
+
+        if send_messages_type.contains(&message_type) {
+            let message_length = (payload.len() + 1) as u32;
+            let message_length_buf = message_length.to_be_bytes();
+            let message_id = message_type.to_message_id();
+            let message_id_buf = message_id.to_be_bytes();
+
+            let mut message: Vec<u8> = Vec::new();
+            message.extend(message_length_buf);
+            message.extend(message_id_buf);
+            message.extend(payload);
+
+            self.stream
+                .write_all(&message)
+                .expect("Could not send the message");
+            println!("Sent message type: {:?}", message_type);
+        } else {
+            panic!("Can not send this type of message: {:?}", message_type);
+        }
+    }
+
+    fn download_block(
+        &mut self,
+        piece_index: u32,
+        block_byte_offset: u32,
+        block_length: u32,
+    ) -> Block {
+        println!(
+            ">> Downloading block {} of piece {}",
+            block_byte_offset, piece_index
+        );
+        // 4. Send a `request` message
+        let mut request_payload: Vec<u8> = Vec::new();
+        request_payload.extend(piece_index.to_be_bytes());
+        request_payload.extend(block_byte_offset.to_be_bytes());
+        request_payload.extend(block_length.to_be_bytes());
+
+        self.send(PeerMessageType::Request, request_payload);
+
+        // 5. Wait for `piece` message
+        let block_data = self.wait(PeerMessageType::Piece);
+
+        let recv_block_data_length = (block_data.len() - 8) as u32;
+        println!("recv_block_data_length: {}", recv_block_data_length);
+
+        assert_eq!(
+            recv_block_data_length, block_length,
+            "Block length expected {} and received {} are not same.",
+            block_length, recv_block_data_length
+        );
+
+        println!(
+            "block of byte offset {} downloaded of block data length: {}",
+            block_byte_offset, recv_block_data_length
+        );
+
+        Block::from(block_data)
+    }
+
+    fn download_piece(&mut self, piece_index: u32, piece_length: u32) -> Piece {
+        println!("> Downloading piece {}", piece_index);
+        let mut blocks: Vec<Block> = Vec::new();
+
+        let mut block_index = 0 as u32;
+        let mut block_byte_offset;
+        let block_length: u32 = 16 * 1024;
+
+        // let mut piece_data: Vec<u8> = Vec::new();
+
+        loop {
+            block_byte_offset = block_index * block_length;
+            if block_byte_offset >= piece_length - 1 {
+                break;
+            }
+            println!("block_byte_offset: {}", block_byte_offset);
+
+            let is_last_block = piece_length - 1 - block_byte_offset < block_length;
+
+            let actual_block_length = if is_last_block {
+                piece_length - block_byte_offset
+            } else {
+                block_length
+            };
+
+            println!("actual_block_length: {}", actual_block_length);
+
+            let block = self.download_block(piece_index, block_byte_offset, actual_block_length);
+
+            // piece_data.extend(&block.block_data);
+            blocks.push(block);
+
+            block_index += 1;
+        }
+
+        // let piece_hash = calculate_hash(&piece_data);
+        // println!("* calculated piece_hash: {:?}", piece_hash);
+
+        Piece::from(blocks)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PeerMessageType {
+    Choke,
+    Unchoke,
+    Interested,
+    NotInterested,
+    Have,
+    BitField,
+    Request,
+    Piece,
+    Cancel,
+}
+
+impl From<u8> for PeerMessageType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Choke,
+            1 => Self::Unchoke,
+            2 => Self::Interested,
+            3 => Self::NotInterested,
+            4 => Self::Have,
+            5 => Self::BitField,
+            6 => Self::Request,
+            7 => Self::Piece,
+            8 => Self::Cancel,
+            _ => panic!("Invalid message id"),
+        }
+    }
+}
+
+impl PeerMessageType {
+    fn to_message_id(&self) -> u8 {
+        match self {
+            Self::Choke => 0,
+            Self::Unchoke => 1,
+            Self::Interested => 2,
+            Self::NotInterested => 3,
+            Self::Have => 4,
+            Self::BitField => 5,
+            Self::Request => 6,
+            Self::Piece => 7,
+            Self::Cancel => 8,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct Block {
+    piece_index: u32,
+    block_byte_offset: u32,
+    block_data: Vec<u8>,
+}
+
+impl Block {
+    fn from(payload: Vec<u8>) -> Self {
+        // extract piece index buffer from payload
+        let piece_index_buf = payload
+            .get(..4)
+            .expect("Not able to extract 4 bytes of piece index from payload");
+
+        // decode the buffer into piece index
+        let piece_index = u32::from_be_bytes(
+            piece_index_buf
+                .try_into()
+                .expect("Not able to convert the extracted 4 bytes to piece index"),
+        );
+
+        // extract block byte offset buffer from payload
+        let block_byte_offset_buf = payload
+            .get(4..8)
+            .expect("Not able to extract the next 4 bytes for block byte offset from payload");
+        // decode the buffer into block byte offset
+        let block_byte_offset = u32::from_be_bytes(
+            block_byte_offset_buf
+                .try_into()
+                .expect("Not able to convert the extracted 4 bytes to block byte offset"),
+        );
+
+        let block_data = payload
+            .get(8..)
+            .expect("Not able to extract block data from the payload")
+            .to_vec();
+
+        let block_data_length = block_data.len() as u32;
+
+        let block_response_payload = Self {
+            piece_index,
+            block_byte_offset,
+            block_data,
+        };
+
+        let required_block_data_length = (payload.len() - 8) as u32;
+
+        assert_eq!(
+            block_data_length, required_block_data_length,
+            "Invalid block data length, expected {} recieved {}",
+            required_block_data_length, block_data_length
+        );
+
+        block_response_payload
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct Piece {
+    piece_index: u32,
+    piece_data: Vec<u8>,
+}
+
+impl Piece {
+    fn from(blocks: Vec<Block>) -> Self {
+        let mut piece_data: Vec<u8> = Vec::new();
+
+        let mut blocks = blocks.clone();
+
+        blocks.sort_by(|b1, b2| {
+            if b1.block_byte_offset < b2.block_byte_offset {
+                Ordering::Less
+            } else if b1.block_byte_offset == b2.block_byte_offset {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
+            }
+        });
+        blocks.iter().for_each(|block| {
+            piece_data.extend(block.block_data.clone());
+        });
+
+        let piece_index = blocks
+            .get(0)
+            .expect("Could not get block from blocks array")
+            .piece_index;
+
+        Self {
+            piece_index,
+            piece_data,
+        }
+    }
+
+    fn get_hash(&self) -> Vec<u8> {
+        calculate_hash(&self.piece_data)
+    }
+}
+
+fn to_hex_string(bytes: &Vec<u8>) -> String {
+    let mut s = String::new();
+    for byte in bytes {
+        s += format!("{:02x}", byte).as_str();
+    }
+    s
+}
+
+fn calculate_hash(bytes: &Vec<u8>) -> Vec<u8> {
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    let hash = hasher.finalize();
+
+    hash.to_vec()
+}
+
+pub fn urlencode_hash(i: &[u8; 20]) -> String {
+    i.into_iter()
+        .map(|&b| match b {
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'-' | b'.' | b'_' | b'~' => {
+                format!("{}", b as char)
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect::<String>()
+}
 
 #[tokio::main]
 async fn main() {
     cli::parse_and_execute().await;
 }
-
-
-// #[allow(dead_code)]
-// async fn download_piece_try() {
-//     // TRYOUT download_piece
-
-//     // Read torrent file to get tracker URL
-//     let torrent_metadata = TorrentMetadata::from_file(PathBuf::from(
-//         // "/home/arindampal/Downloads/congratulations.gif.torrent",
-//         "sample.torrent",
-//     ));
-
-//     // println!("info_hash: {}", torrent_metadata.info.hash_str());
-
-//     // Perform the tracker GET request to get list of peers
-//     let tracker_response = TrackerResponse::from(&torrent_metadata).await;
-
-//     let peers = tracker_response.get_peers();
-//     // peers.iter().for_each(|peer| {
-//     //     println!("{}", peer);
-//     // });
-
-//     let peer = peers.get(1).expect("There is no peer at that index");
-//     println!("peer_addr: {}", peer);
-
-//     // Establish a TCP connection with a peer, and
-//     let mut connection = Connection::new(peer.clone());
-
-//     // Perform a handshake
-//     // let peer_id =
-//     connection.handshake(
-//         torrent_metadata.info.hash_bytes().to_vec(),
-//         "00112233445566778899",
-//     );
-//     // println!("peer_id: {}", to_hex_string(&peer_id));
-
-//     let piece_index = 0 as u32;
-//     println!("piece_index: {}", piece_index);
-
-//     let pieces_count = torrent_metadata.info.pieces.chunks(20).len() as u32;
-//     println!("pieces_count: {}", pieces_count);
-
-//     // check piece_index if valid
-//     if piece_index >= pieces_count {
-//         return;
-//     }
-
-//     let piece_length = torrent_metadata.info.piece_length;
-//     println!("piece_lenght: {}", piece_length);
-
-//     let file_length = torrent_metadata
-//         .info
-//         .length
-//         .expect("Torrent file length was not present");
-//     println!("file_length: {}", file_length);
-
-//     let actual_piece_length = if piece_index == pieces_count - 1 {
-//         // (torrent.length() - (torrent.info.piece_length as u64 * piece_id as u64)) as u32
-//         file_length - (piece_length * piece_index)
-//     } else {
-//         piece_length
-//     };
-
-//     println!("actual_piece_length: {}", actual_piece_length);
-
-//     let send_message_types = vec![PeerMessageType::Interested, PeerMessageType::Request];
-
-//     let message_type = PeerMessageType::Interested;
-//     if send_message_types.contains(&message_type) {
-//         println!("here");
-//     }
-
-//     // Peer Messages
-//     // 1. Wait for a `bitfield` message
-//     wait(&mut connection, PeerMessageType::BitField);
-//     println!("WAIT `bitfield`");
-
-//     // 2. Send an `interested` message
-//     let interested_payload: Vec<u8> = vec![2];
-//     send(
-//         &mut connection,
-//         PeerMessageType::Interested,
-//         interested_payload,
-//     );
-//     println!("SEND `interested`");
-
-//     // 3. Wait for `unchoke`
-//     wait(&mut connection, PeerMessageType::Unchoke);
-//     println!("WAIT `unchoke`");
-
-//     // 4. send piece `request`
-//     let block_index = 0 as u32;
-//     let block_length = 16 * 1024 as u32;
-
-//     let mut request_payload: Vec<u8> = Vec::new();
-//     request_payload.extend(piece_index.to_be_bytes());
-//     request_payload.extend(block_index.to_be_bytes());
-//     request_payload.extend(block_length.to_be_bytes());
-
-//     send(&mut connection, PeerMessageType::Request, request_payload);
-//     println!("SEND `request`");
-
-//     // 5. wait for `piece` message
-//     let (_, block_buf) = wait(&mut connection, PeerMessageType::Piece);
-//     println!("block_buf length: {}", block_buf.len());
-// }
-
-// fn wait(connection: &mut Connection, message_type: PeerMessageType) -> (u32, Vec<u8>) {
-//     let wait_message_types = vec![
-//         PeerMessageType::BitField,
-//         PeerMessageType::Unchoke,
-//         PeerMessageType::Piece,
-//     ];
-
-//     // check if can wait for given message_type
-//     if wait_message_types.contains(&message_type) {
-//         // read message length (4 Bytes)
-//         let mut recv_buf_length: [u8; 4] = [0; 4];
-//         connection
-//             .stream
-//             .read_exact(&mut recv_buf_length)
-//             .expect("PeerMessage::wait - Failed to read length prefix");
-//         // println!("buf_length: {:?}", buf_length);
-
-//         // message = message_id + payload
-//         let recv_message_length = u32::from_be_bytes(recv_buf_length);
-//         println!("length: {}", recv_message_length);
-
-//         // read message id (1 Byte)
-//         let mut recv_buf_message_id: [u8; 1] = [0; 1];
-//         connection
-//             .stream
-//             .read_exact(&mut recv_buf_message_id)
-//             .expect("PeerMessage::wait - Failed to read message id");
-//         // println!("buf_message_id: {:?}", buf_message_id);
-//         let recv_message_id = u8::from_be_bytes(recv_buf_message_id);
-//         // println!("message_id: {}", message_id);
-//         let recv_message_type = PeerMessageType::from(recv_message_id);
-//         // println!("message_type (enum): {:?}", message_type);
-
-//         if recv_message_type != message_type {
-//             panic!(
-//                 "PeerMessage::wait - message_id should be {:?}",
-//                 message_type
-//             );
-//         }
-
-//         // read payload
-//         let payload_length = (recv_message_length - 1) as usize;
-//         let mut recv_payload_buf: Vec<u8> = vec![0; payload_length];
-//         connection
-//             .stream
-//             .read_exact(&mut recv_payload_buf)
-//             .expect("PeerMessage::wait - Failed to read payload");
-//         // println!("buf_payload read of size: {}", recv_payload_buf.len());
-
-//         // return PeerMessage
-//         return (recv_message_length, recv_payload_buf);
-//     }
-
-//     panic!(
-//         "PeerMessage::wait - Cannot create wait message for message_type {:?}",
-//         message_type
-//     );
-// }
-
-// fn send(connection: &mut Connection, message_type: PeerMessageType, payload: Vec<u8>) {
-//     let send_message_types = vec![PeerMessageType::Interested, PeerMessageType::Request];
-
-//     if send_message_types.contains(&message_type) {
-//         // bytes to send (message_id + payload)
-//         // adding message id to message_buf
-//         let message_id_byte = message_type.to_message_id();
-//         let mut message_buf: Vec<u8> = vec![message_id_byte];
-
-//         // adding payload to message_buf
-//         message_buf.extend(&payload);
-
-//         // calculating message_buf length
-//         let message_length = message_buf.len() as u32;
-//         let message_length_buf = message_length.to_be_bytes();
-
-//         // sending message length
-//         connection
-//             .stream
-//             .write_all(&message_length_buf)
-//             .expect("request message length could not be sent");
-//         // sending the message
-//         connection
-//             .stream
-//             .write_all(&message_buf)
-//             .expect("request message could not be sent");
-
-//         return;
-//     }
-
-//     panic!(
-//         "Cannot create send message for message_type {:?}",
-//         message_type
-//     );
-// }
