@@ -63,7 +63,7 @@ pub async fn execute(args: &DownloadPieceArgs) {
     // perform handshake
     // let res_peer_id =
     connection.handshake(info_hash, peer_id);
-    // println!("res_peer_id: {}", res_peer_id);
+    // println!("res_peer_id: {}", to_hex_string(&res_peer_id));
 
     // Send and wait for peer messages
     // 1. Wait for `bitfield`
@@ -89,17 +89,14 @@ pub async fn execute(args: &DownloadPieceArgs) {
     let piece = connection.download_piece_pipelined(5, piece_index, actual_piece_length);
 
     // verify piece hash
-    let piece_hashes = torrent_metadata.info.get_piece_hashes();
+    let piece_hashes_str = torrent_metadata.info.get_piece_hashes_str();
     // piece_hashes.iter().enumerate().for_each(|(index, piece_hash)| {
     //     println!("piece {} hash: {:?}", index, piece_hash);
     // });
 
-    let actual_piece_hash = piece_hashes
+    let actual_piece_hash_str = piece_hashes_str
         .get(piece_index as usize)
-        .expect(format!("Could not get piece hash at piece index {}", piece_index).as_str());
-    // println!("actual_piece_hash: {:?}", actual_piece_hash);
-
-    let actual_piece_hash_str = to_hex_string(&actual_piece_hash.clone());
+        .expect(format!("Could not get piece hash at piece index {}", piece_index).as_str()).clone();
     println!("actual_piece_hash_str: {}", actual_piece_hash_str);
 
     let calculated_piece_hash = piece.get_hash();

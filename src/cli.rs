@@ -1,9 +1,6 @@
 use clap::{Parser, Subcommand};
 
-use crate::{
-    decode::{DecodeArgs, self}, download_piece::{DownloadPieceArgs, self}, handshake::{HandshakeArgs, self},
-    info::{InfoArgs, self}, peers::{PeersArgs, self},
-};
+use crate::{decode, download, download_piece, handshake, info, peers};
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -19,12 +16,13 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Decode(DecodeArgs),
-    Info(InfoArgs),
-    Peers(PeersArgs),
-    Handshake(HandshakeArgs),
+    Decode(decode::DecodeArgs),
+    Info(info::InfoArgs),
+    Peers(peers::PeersArgs),
+    Handshake(handshake::HandshakeArgs),
     #[clap(name = "download_piece")]
-    DownloadPiece(DownloadPieceArgs),
+    DownloadPiece(download_piece::DownloadPieceArgs),
+    Download(download::DownloadArgs),
 }
 
 pub async fn parse_and_execute() {
@@ -35,5 +33,6 @@ pub async fn parse_and_execute() {
         Command::Peers(args) => peers::execute(args).await,
         Command::Handshake(args) => handshake::execute(args),
         Command::DownloadPiece(args) => download_piece::execute(args).await,
+        Command::Download(args) => download::execute(args).await,
     };
 }

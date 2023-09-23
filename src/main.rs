@@ -11,10 +11,11 @@ use sha1::{Digest, Sha1};
 
 mod cli;
 mod decode;
-mod download_piece;
-mod handshake;
 mod info;
 mod peers;
+mod handshake;
+mod download_piece;
+mod download;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Info {
