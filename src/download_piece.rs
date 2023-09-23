@@ -1,6 +1,6 @@
-use std::path::PathBuf;
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 
 use clap::Args;
 
@@ -41,6 +41,25 @@ pub async fn execute(args: &DownloadPieceArgs) {
 
     let info_hash = torrent_metadata.info.hash_bytes().to_vec();
 
+    let torrent_file_length = torrent_metadata
+        .info
+        .length
+        .expect("Could not get length of torrent file");
+    println!("torrent_file_length: {}", torrent_file_length);
+    let pieces_count = torrent_metadata.info.get_pieces_count() as u32;
+    println!("pieces_count: {}", pieces_count);
+    let piece_index = args.piece as u32;
+    println!("piece_index: {}", piece_index);
+    let piece_length = torrent_metadata.info.piece_length as u32;
+    println!("piece_length: {}", piece_length);
+
+    // check if the piece index exists
+    assert!(
+        piece_index < pieces_count,
+        "This piece does not exists, max pieces: {}",
+        pieces_count
+    );
+
     // perform handshake
     // let res_peer_id =
     connection.handshake(info_hash, peer_id);
@@ -56,24 +75,7 @@ pub async fn execute(args: &DownloadPieceArgs) {
     // 3. Wait until `unchoke` is received
     connection.wait(PeerMessageType::Unchoke);
 
-    let torrent_file_length = torrent_metadata
-        .info
-        .length
-        .expect("Could not get length of torrent file");
-    println!("torrent_file_length: {}", torrent_file_length);
-    let pieces_count = torrent_metadata.info.get_pieces_count() as u32;
-    println!("pieces_count: {}", pieces_count);
-    let piece_index = args.piece as u32;
-    println!("piece_index: {}", piece_index);
-    let piece_length = torrent_metadata.info.piece_length as u32;
-    println!("piece_length: {}", piece_length);
-
-    assert!(
-        piece_index < pieces_count,
-        "This piece does not exists, max pieces: {}",
-        pieces_count
-    );
-
+    // calculate actual piece length
     let is_last_piece = torrent_file_length - piece_index * piece_length < piece_length;
     let actual_piece_length = if is_last_piece {
         torrent_file_length - piece_index * piece_length
@@ -83,7 +85,8 @@ pub async fn execute(args: &DownloadPieceArgs) {
     println!("actual_piece_length: {}", actual_piece_length);
 
     // download a piece
-    let piece = connection.download_piece(piece_index, actual_piece_length);
+    // let piece = connection.download_piece(piece_index, actual_piece_length);
+    let piece = connection.download_piece_pipelined(5, piece_index, actual_piece_length);
 
     // verify piece hash
     let piece_hashes = torrent_metadata.info.get_piece_hashes();

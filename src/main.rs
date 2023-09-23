@@ -1,5 +1,6 @@
 use core::panic;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -134,6 +135,7 @@ struct Connection {
     stream: TcpStream,
 }
 
+#[allow(dead_code)]
 impl Connection {
     fn new(peer: String) -> Self {
         let stream = TcpStream::connect(peer).expect("tcp connection failed!");
@@ -240,7 +242,7 @@ impl Connection {
         block_length: u32,
     ) -> Block {
         println!(
-            ">> Downloading block {} of piece {}",
+            ">> Sending request for block {} of piece {}",
             block_byte_offset, piece_index
         );
         // 4. Send a `request` message
@@ -254,8 +256,9 @@ impl Connection {
         // 5. Wait for `piece` message
         let block_data = self.wait(PeerMessageType::Piece);
 
-        let recv_block_data_length = (block_data.len() - 8) as u32;
-        println!("recv_block_data_length: {}", recv_block_data_length);
+        let block = Block::from(block_data);
+
+        let recv_block_data_length = block.block_data.len() as u32;
 
         assert_eq!(
             recv_block_data_length, block_length,
@@ -264,20 +267,24 @@ impl Connection {
         );
 
         println!(
-            "block of byte offset {} downloaded of block data length: {}",
+            ">> Downloaded block of byte offset {} of block data length: {}",
             block_byte_offset, recv_block_data_length
         );
 
-        Block::from(block_data)
+        block
     }
 
     fn download_piece(&mut self, piece_index: u32, piece_length: u32) -> Piece {
         println!("> Downloading piece {}", piece_index);
+
+        let block_length: u32 = 16 * 1024;
+        // let blocks_count = (piece_length / block_length) + 5 - block_length * (piece_length / block_length);
+        // println!(">> Piece {} contains {} blocks", piece_index, blocks_count);
+
         let mut blocks: Vec<Block> = Vec::new();
 
         let mut block_index = 0 as u32;
         let mut block_byte_offset;
-        let block_length: u32 = 16 * 1024;
 
         // let mut piece_data: Vec<u8> = Vec::new();
 
@@ -308,6 +315,125 @@ impl Connection {
 
         // let piece_hash = calculate_hash(&piece_data);
         // println!("* calculated piece_hash: {:?}", piece_hash);
+
+        Piece::from(blocks)
+    }
+
+    fn download_blocks_pipelined(
+        &mut self,
+        no_of_requests: usize,
+        piece_index: u32,
+        piece_length: u32,
+        block_index: &mut u32,
+    ) -> Vec<Block> {
+        let mut no_of_requests_sent = 0 as usize;
+        let mut blocks: Vec<Block> = Vec::new();
+
+        let mut block_byte_offset;
+        let block_length = 16 * 1024 as u32;
+        // let mut actual_block_lengths: Vec<u32> = vec![];
+        let mut actual_block_lengths = HashMap::new();
+
+        for _ in 0..no_of_requests {
+            block_byte_offset = *block_index * block_length;
+            if block_byte_offset >= piece_length - 1 {
+                break;
+            }
+
+            println!(
+                ">> Sending request for block byte offset {} of piece {}",
+                block_byte_offset, piece_index
+            );
+
+            let is_last_block = piece_length - 1 - block_byte_offset < block_length;
+
+            println!("is_last_block: {}", is_last_block);
+            println!("piece data left: {}", piece_length - block_byte_offset);
+
+            let actual_block_length = if is_last_block {
+                piece_length - block_byte_offset
+            } else {
+                block_length
+            };
+            println!("actual_block_length: {}", actual_block_length);
+
+            // actual_block_lengths.push(actual_block_length);
+            actual_block_lengths.insert(block_byte_offset, actual_block_length);
+
+            // 4. Send a `request` message
+            let mut request_payload: Vec<u8> = Vec::new();
+            request_payload.extend(piece_index.to_be_bytes());
+            request_payload.extend(block_byte_offset.to_be_bytes());
+            request_payload.extend(actual_block_length.to_be_bytes());
+
+            self.send(PeerMessageType::Request, request_payload);
+
+            *block_index += 1;
+            no_of_requests_sent += 1;
+        }
+
+        for _ in 0..no_of_requests_sent {
+            println!(">> Waiting for next block");
+            let block_data = self.wait(PeerMessageType::Piece);
+
+            let block = Block::from(block_data);
+            let recv_block_length = block.block_data.len() as u32;
+
+            let actual_block_length = *actual_block_lengths.get(&block.block_byte_offset).expect(
+                format!(
+                    "Could not get value for the key: {}",
+                    block.block_byte_offset
+                )
+                .as_str(),
+            );
+            assert_eq!(
+                recv_block_length, actual_block_length,
+                "Block length expected {} and received {} are not same.",
+                actual_block_length, recv_block_length
+            );
+
+            println!(
+                ">> block of byte offset {} downloaded of block length: {}",
+                block.block_byte_offset, recv_block_length
+            );
+
+            blocks.push(block);
+        }
+
+        blocks
+    }
+
+    fn download_piece_pipelined(
+        &mut self,
+        no_of_requests: usize,
+        piece_index: u32,
+        piece_length: u32,
+    ) -> Piece {
+        println!("> Downloading piece {}", piece_index);
+
+        let block_length = 16 * 1024 as u32;
+        // let blocks_count = (piece_length / block_length) + 5 - block_length * (piece_length / block_length);
+        // println!(">> Piece {} contains {} blocks", piece_index, blocks_count);
+
+        let mut blocks: Vec<Block> = Vec::new();
+
+        let mut block_index = 0 as u32;
+
+        loop {
+            let block_byte_offset = block_index * block_length;
+            if block_byte_offset >= piece_length - 1 {
+                break;
+            }
+
+            let next_blocks = self.download_blocks_pipelined(
+                no_of_requests,
+                piece_index,
+                piece_length,
+                &mut block_index,
+            );
+
+            blocks.extend(next_blocks);
+        }
 
         Piece::from(blocks)
     }
